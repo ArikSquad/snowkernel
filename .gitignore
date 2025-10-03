@@ -1,4 +1,6 @@
+.vscode/
 build/
 *.o
 *.iso
 *.bin
+*.img

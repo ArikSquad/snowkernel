@@ -1,27 +1,33 @@
 #include "fs.h"
+#include "../kernel/kprint.h"
 #include "../kernel/string.h"
-#include <stdint.h>
-#include <stddef.h>
-#ifndef FS_VERBOSE
-#define FS_VERBOSE 0
-#endif
-#if FS_VERBOSE
-#define FS_LOG(...) kprintf(__VA_ARGS__)
-#else
-#define FS_LOG(...) \
-    do              \
-    {               \
-    } while (0)
-#endif
 
-static node_t root;
-static node_t *cwd;
-static node_t nodes[512];
-static int ni = 0;
-static char arena[131072];
-static size_t aoff = 0;
+void fs_mem_init(void);
+extern void fs_init(void); // original symbol; we will wrap
+extern node_t *fs_root(void);
+extern node_t *fs_cwd(void);
+extern void fs_set_cwd(node_t *n);
+extern node_t *fs_mkdir(node_t *parent, const char *name);
+extern node_t *fs_lookup(node_t *parent, const char *path);
+extern node_t *fs_create_file(node_t *parent, const char *name);
+extern int fs_write(node_t *f, const char *data, size_t len, int append);
+extern int fs_read(node_t *f, char *out, size_t max);
+extern node_t *fs_find_child(node_t *parent, const char *name);
+extern node_t *fs_unlink(node_t *parent, const char *name);
+extern int fs_rename(node_t *parent, const char *oldn, const char *newn);
+extern node_t *fs_clone_file(node_t *parent, node_t *src, const char *newname);
+extern void fs_stats(size_t *out_nodes, size_t *out_arena_used, size_t *out_arena_total);
 
-static node_t *add_child(node_t *p, node_t *n)
+typedef struct node node_t; // already in header, forward clarity
+
+static node_t d_root; // disk fs root (in-memory mirror)
+static node_t *d_cwd;
+static node_t d_nodes[512];
+static int d_ni = 0;
+static char d_arena[131072];
+static size_t d_aoff = 0;
+
+static node_t *d_add_child(node_t *p, node_t *n)
 {
     n->parent = p;
     n->sibling = p->child;
@@ -31,8 +37,7 @@ static node_t *add_child(node_t *p, node_t *n)
     p->child = n;
     return n;
 }
-
-static node_t *find_in(node_t *p, const char *name)
+static node_t *d_find_in(node_t *p, const char *name)
 {
     for (node_t *c = p->child; c; c = c->sibling)
         if (kstrcmp(c->name, name) == 0)
@@ -42,91 +47,40 @@ static node_t *find_in(node_t *p, const char *name)
 
 void fs_init(void)
 {
-    extern void kprintf(const char *, ...);
-    FS_LOG("[fs] fs_init: entry\n");
-    FS_LOG("[fs] fs_init: root=0x%x nodes=0x%x arena=0x%x aoff=0x%x size=%u\n",
-           (unsigned)(uintptr_t)&root, (unsigned)(uintptr_t)nodes, (unsigned)(uintptr_t)arena, (unsigned)(uintptr_t)&aoff, (unsigned)sizeof(root));
-    FS_LOG("[fs] fs_init: about to zero root (%u bytes)\n", (unsigned)sizeof(root));
-    unsigned char *_p = (unsigned char *)&root;
-    for (size_t _i = 0; _i < sizeof(root); ++_i)
-    {
-        _p[_i] = 0;
-        if (_i == 0)
-            FS_LOG("[fs] fs_init: zeroed first byte\n");
-    }
-    FS_LOG("[fs] fs_init: zeroed all bytes\n");
-    FS_LOG("[fs] fs_init: about to copy name\n");
-    kstrcpy(root.name, "/");
-    FS_LOG("[fs] fs_init: name copied -> %s\n", root.name);
-    FS_LOG("[fs] fs_init: about to set fields\n");
-    root.type = NODE_DIR;
-    root.parent = 0;
-    root.child = 0;
-    root.sibling = 0;
-    FS_LOG("[fs] fs_init: fields set\n");
-    FS_LOG("[fs] fs_init: about to set cwd\n");
-    cwd = &root;
-    FS_LOG("[fs] fs_init: cwd set\n");
-    FS_LOG("[fs] fs_init: done\n");
+    kprintf("[fs-disk] transitional disk backend (embedded mem layer)\n");
+    kmemset(&d_root, 0, sizeof(d_root));
+    d_root.name[0] = '/';
+    d_root.name[1] = 0;
+    d_root.type = NODE_DIR;
+    d_cwd = &d_root;
 }
 
-node_t *fs_root(void) { return &root; }
-node_t *fs_cwd(void) { return cwd; }
+node_t *fs_root(void) { return &d_root; }
+node_t *fs_cwd(void) { return d_cwd; }
 void fs_set_cwd(node_t *n)
 {
     if (n && n->type == NODE_DIR)
-        cwd = n;
+        d_cwd = n;
 }
-
 node_t *fs_mkdir(node_t *parent, const char *name)
 {
-    extern void kprintf(const char *, ...);
-    FS_LOG("[fs] fs_mkdir: parent=0x%x name=%s ni=%u\n", (unsigned)(uintptr_t)parent, name ? name : "(null)", (unsigned)ni);
     if (!parent || parent->type != NODE_DIR)
-    {
-        FS_LOG("[fs] fs_mkdir: invalid parent\n");
         return 0;
-    }
-    if (find_in(parent, name))
-    {
-        FS_LOG("[fs] fs_mkdir: already exists\n");
+    if (d_find_in(parent, name))
         return 0;
-    }
-    if (ni >= 512)
-    {
-        FS_LOG("[fs] fs_mkdir: node table full\n");
+    if (d_ni >= 512)
         return 0;
-    }
-    node_t *n = &nodes[ni++];
-    FS_LOG("[fs] fs_mkdir: allocated node 0x%x (ni now %u)\n", (unsigned)(uintptr_t)n, (unsigned)ni);
-    for (size_t i = 0; i < sizeof(*n); ++i)
-        ((unsigned char *)n)[i] = 0;
-    if (name)
-    {
-        size_t j = 0;
-        for (; j < 31 && name[j]; ++j)
-            n->name[j] = name[j];
-        n->name[j] = 0;
-    }
-    else
-    {
-        n->name[0] = 0;
-    }
+    node_t *n = &d_nodes[d_ni++];
+    kmemset(n, 0, sizeof(*n));
+    kstrncpy(n->name, name, 31);
     n->type = NODE_DIR;
-    n->data = 0;
-    n->size = 0;
-    n->parent = parent;
-    n->sibling = parent->child;
-    parent->child = n;
-    FS_LOG("[fs] fs_mkdir: parent->child now 0x%x\n", (unsigned)(uintptr_t)parent->child);
-    return n;
+    return d_add_child(parent, n);
 }
-
 node_t *fs_create_file(node_t *parent, const char *name)
 {
     if (!parent || parent->type != NODE_DIR)
         return 0;
-    node_t *e = find_in(parent, name);
+    node_t *e = d_find_in(parent, name);
     if (e)
     {
         if (e->type == NODE_FILE)
@@ -134,21 +88,20 @@ node_t *fs_create_file(node_t *parent, const char *name)
         else
             return 0;
     }
-    if (ni >= 512)
+    if (d_ni >= 512)
         return 0;
-    node_t *n = &nodes[ni++];
+    node_t *n = &d_nodes[d_ni++];
     kmemset(n, 0, sizeof(*n));
     kstrncpy(n->name, name, 31);
     n->type = NODE_FILE;
-    return add_child(parent, n);
+    return d_add_child(parent, n);
 }
-
 node_t *fs_lookup(node_t *parent, const char *path)
 {
     if (!path || !*path)
         return parent;
     if (path[0] == '/')
-        parent = &root;
+        parent = &d_root;
     char tmp[128];
     kstrncpy(tmp, path, 127);
     char *s = tmp;
@@ -172,7 +125,7 @@ node_t *fs_lookup(node_t *parent, const char *path)
                 }
                 else
                 {
-                    node_t *f = find_in(cur, tok);
+                    node_t *f = d_find_in(cur, tok);
                     if (!f)
                         return 0;
                     cur = f;
@@ -185,37 +138,35 @@ node_t *fs_lookup(node_t *parent, const char *path)
     }
     return cur;
 }
-
 int fs_write(node_t *f, const char *data, size_t len, int append)
 {
     if (!f || f->type != NODE_FILE)
         return -1;
     if (!append)
     {
-        if (aoff + len > sizeof(arena))
+        if (d_aoff + len > sizeof(d_arena))
             return -2;
-        f->data = &arena[aoff];
+        f->data = &d_arena[d_aoff];
         kmemcpy(f->data, data, len);
         f->size = len;
-        aoff += len;
+        d_aoff += len;
         return 0;
     }
     else
     {
         size_t newsize = f->size + len;
-        if (aoff + newsize > sizeof(arena))
+        if (d_aoff + newsize > sizeof(d_arena))
             return -2;
-        char *nd = &arena[aoff];
+        char *nd = &d_arena[d_aoff];
         if (f->size)
             kmemcpy(nd, f->data, f->size);
         kmemcpy(nd + f->size, data, len);
         f->data = nd;
         f->size = newsize;
-        aoff += newsize;
+        d_aoff += newsize;
         return 0;
     }
 }
-
 int fs_read(node_t *f, char *out, size_t max)
 {
     if (!f || f->type != NODE_FILE || !f->data)
@@ -224,14 +175,12 @@ int fs_read(node_t *f, char *out, size_t max)
     kmemcpy(out, f->data, n);
     return (int)n;
 }
-
 node_t *fs_find_child(node_t *parent, const char *name)
 {
     if (!parent || parent->type != NODE_DIR)
         return 0;
-    return find_in(parent, name);
+    return d_find_in(parent, name);
 }
-
 node_t *fs_unlink(node_t *parent, const char *name)
 {
     if (!parent || parent->type != NODE_DIR)
@@ -252,49 +201,46 @@ node_t *fs_unlink(node_t *parent, const char *name)
     }
     return 0;
 }
-
 int fs_rename(node_t *parent, const char *oldn, const char *newn)
 {
     node_t *n = fs_find_child(parent, oldn);
     if (!n)
         return -1;
-    if (find_in(parent, newn))
+    if (d_find_in(parent, newn))
         return -2;
     kstrncpy(n->name, newn, 31);
     return 0;
 }
-
 node_t *fs_clone_file(node_t *parent, node_t *src, const char *newname)
 {
     if (!parent || parent->type != NODE_DIR || !src || src->type != NODE_FILE)
         return 0;
-    if (find_in(parent, newname))
+    if (d_find_in(parent, newname))
         return 0;
-    if (ni >= 512)
+    if (d_ni >= 512)
         return 0;
-    node_t *n = &nodes[ni++];
+    node_t *n = &d_nodes[d_ni++];
     kmemset(n, 0, sizeof(*n));
     kstrncpy(n->name, newname, 31);
     n->type = NODE_FILE;
     if (src->size)
     {
-        if (aoff + src->size > sizeof(arena))
+        if (d_aoff + src->size > sizeof(d_arena))
             return 0;
-        n->data = &arena[aoff];
+        n->data = &d_arena[d_aoff];
         kmemcpy(n->data, src->data, src->size);
         n->size = src->size;
-        aoff += src->size;
+        d_aoff += src->size;
     }
-    add_child(parent, n);
+    d_add_child(parent, n);
     return n;
 }
-
 void fs_stats(size_t *out_nodes, size_t *out_arena_used, size_t *out_arena_total)
 {
     if (out_nodes)
-        *out_nodes = (size_t)ni;
+        *out_nodes = (size_t)d_ni;
     if (out_arena_used)
-        *out_arena_used = aoff;
+        *out_arena_used = d_aoff;
     if (out_arena_total)
-        *out_arena_total = sizeof(arena);
+        *out_arena_total = sizeof(d_arena);
 }

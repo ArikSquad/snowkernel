@@ -4,7 +4,7 @@ A tiny OS (well a kernel) that has a few commands. Inspired from DOS. Built with
 
 ## Build
 
-you need these:
+you need these for x86_32:
 - nasm
 - gcc or i686-elf-gcc
 - ld or i686-elf-ld
@@ -16,4 +16,4 @@ make iso
 make run
 ```
 
-The filesystem is RAM-only and resets on reboot.
+you can also run it on x86_64 with `make run ARCH=x86_64`
