@@ -19,3 +19,5 @@ make userprogs
 make iso
 make run
 ```
+
+Last commit with 32-bit support is 2e4d00061fed1183adb9f77e681e242306fca6b6
