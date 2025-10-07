@@ -71,7 +71,6 @@ int kbd_read_line(char *buf, int max)
 
 int kbd_getc_nonblock(void) { return keymap_get_char(); }
 
-/* Poll & drain available characters to active tty (call from IRQ handler later) */
 void kbd_drain_to_tty(void)
 {
     int ch;
