@@ -17,9 +17,8 @@ static void scroll()
 {
     if (cy < VGA_HEIGHT)
         return;
-    // Mmove lines up by one
+
     kmemcpy(vga, vga + VGA_WIDTH, (VGA_HEIGHT - 1) * VGA_WIDTH * sizeof(uint16_t));
-    // clear last line
     for (size_t x = 0; x < VGA_WIDTH; ++x)
         vga[(VGA_HEIGHT - 1) * VGA_WIDTH + x] = make_cell(' ');
     cy = VGA_HEIGHT - 1;
@@ -182,6 +181,18 @@ static void kvprintf(const char *fmt, va_list ap)
                     kputc(buf[i]);
             break;
         }
+        case 'p':
+        {
+            unsigned long long v = (unsigned long long)va_arg(ap, void *);
+            const char *hex = "0123456789abcdef";
+            kputc('0'); kputc('x');
+            /* print full 16 hex digits */
+            for (int shift = 60; shift >= 0; shift -= 4) {
+                unsigned d = (v >> shift) & 0xF;
+                kputc(hex[d]);
+            }
+            break;
+        }
         case '%':
             kputc('%');
             break;
@@ -199,6 +210,107 @@ void kprintf(const char *fmt, ...)
     va_start(ap, fmt);
     kvprintf(fmt, ap);
     va_end(ap);
+}
+
+/* Internal helper: write a single char into a bounded buffer */
+static void buf_putc(char **bufp, size_t *rem, char c)
+{
+    if (*rem > 1) {
+        **bufp = c;
+        (*bufp)++;
+        (*rem)--;
+    }
+}
+
+static void kvsnprintf(char **bufp, size_t *rem, const char *fmt, va_list ap)
+{
+    for (const char *p = fmt; *p; ++p)
+    {
+        if (*p != '%')
+        {
+            buf_putc(bufp, rem, *p);
+            continue;
+        }
+        ++p;
+        switch (*p)
+        {
+        case 's':
+        {
+            const char *s = va_arg(ap, const char *);
+            if (!s)
+                s = "(null)";
+            while (*s) buf_putc(bufp, rem, *s++);
+            break;
+        }
+        case 'c':
+        {
+            char c = (char)va_arg(ap, int);
+            buf_putc(bufp, rem, c);
+            break;
+        }
+        case 'd':
+        {
+            int v = va_arg(ap, int);
+            if (v < 0)
+            {
+                buf_putc(bufp, rem, '-');
+                v = -v;
+            }
+            char buf[16]; int i = 0;
+            do { buf[i++] = '0' + (v % 10); v /= 10; } while (v && i < 15);
+            while (i--) buf_putc(bufp, rem, buf[i]);
+            break;
+        }
+        case 'u':
+        {
+            unsigned v = va_arg(ap, unsigned);
+            char buf[16]; int i = 0;
+            do { buf[i++] = '0' + (v % 10); v /= 10; } while (v && i < 15);
+            while (i--) buf_putc(bufp, rem, buf[i]);
+            break;
+        }
+        case 'x':
+        {
+            unsigned v = va_arg(ap, unsigned);
+            const char *hex = "0123456789abcdef";
+            char buf[16]; int i = 0;
+            do { buf[i++] = hex[v & 15]; v >>= 4; } while (v && i < 15);
+            if (i == 0) buf_putc(bufp, rem, '0'); else while (i--) buf_putc(bufp, rem, buf[i]);
+            break;
+        }
+        case 'p':
+        {
+            unsigned long long v = (unsigned long long)va_arg(ap, void *);
+            const char *hex = "0123456789abcdef";
+            buf_putc(bufp, rem, '0'); buf_putc(bufp, rem, 'x');
+            for (int shift = 60; shift >= 0; shift -= 4) {
+                unsigned d = (v >> shift) & 0xF;
+                buf_putc(bufp, rem, hex[d]);
+            }
+            break;
+        }
+        case '%': buf_putc(bufp, rem, '%'); break;
+        default: buf_putc(bufp, rem, '%'); buf_putc(bufp, rem, *p); break;
+        }
+    }
+}
+
+int ksnprintf(char *buf, size_t bufsz, const char *fmt, ...)
+{
+    if (bufsz == 0) return 0;
+    char *b = buf;
+    size_t rem = bufsz;
+    va_list ap;
+    va_start(ap, fmt);
+    kvsnprintf(&b, &rem, fmt, ap);
+    va_end(ap);
+    /* ensure null termination */
+    if (rem > 0) {
+        *b = '\0';
+    } else {
+        buf[bufsz-1] = '\0';
+    }
+    return (int)(bufsz - rem);
 }
 
 void kclear(void)

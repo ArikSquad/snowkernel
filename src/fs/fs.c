@@ -143,6 +143,29 @@ node_t *fs_create_file(node_t *parent, const char *name)
     return add_child(parent, n);
 }
 
+node_t *fs_create_chardev(node_t *parent, const char *name, void *devptr)
+{
+    if (!parent || parent->type != NODE_DIR)
+        return 0;
+    node_t *e = find_in(parent, name);
+    if (e)
+    {
+        if (e->type == NODE_CHAR)
+            return e;
+        else
+            return 0;
+    }
+    if (ni >= 512)
+        return 0;
+    node_t *n = &nodes[ni++];
+    kmemset(n, 0, sizeof(*n));
+    kstrncpy(n->name, name, 31);
+    n->type = NODE_CHAR;
+    n->data = (char*)devptr;
+    n->size = 0;
+    return add_child(parent, n);
+}
+
 node_t *fs_lookup(node_t *parent, const char *path)
 {
     if (!path || !*path)
@@ -192,8 +215,11 @@ int fs_write(node_t *f, const char *data, size_t len, int append)
         return -1;
     if (!append)
     {
-        if (aoff + len > sizeof(arena))
-            return -2;
+        if (aoff + len > sizeof(arena)) {
+            f->data = (char*)data;
+            f->size = len;
+            return 0;
+        }
         f->data = &arena[aoff];
         kmemcpy(f->data, data, len);
         f->size = len;

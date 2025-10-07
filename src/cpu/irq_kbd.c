@@ -1,6 +1,6 @@
 #include "irq.h"
-#include "keyboard.h"
-#include "kprint.h"
+#include "../drivers/keyboard.h"
+#include "../kernel/kprint.h"
 #include "keymap.h"
 #include <stdint.h>
 
@@ -21,6 +21,8 @@ static void kbd_irq(void)
         uint8_t sc = inb(0x60);
         keymap_process_scancode(sc);
     }
+    extern void kbd_drain_to_tty(void);
+    kbd_drain_to_tty();
 }
 
 void irq_kbd_install(void) { irq_install_handler(1, kbd_irq); }

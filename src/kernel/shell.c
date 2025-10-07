@@ -1,10 +1,11 @@
 #include "shell.h"
 #include "kprint.h"
-#include "keyboard.h"
+#include "../drivers/keyboard.h"
 #include "serial.h"
 #include "../fs/fs.h"
 #include "string.h"
 #include "env.h"
+#include "syscall.h"
 
 typedef void (*cmd_fn)(char *);
 typedef struct
@@ -81,6 +82,9 @@ static void builtin_edit(char *);
 static void builtin_env(char *);
 static void builtin_set(char *);
 static void builtin_unset(char *);
+static void builtin_exit(char *arg);
+static void builtin_export(char *arg);
+static void builtin_ui(char *args);
 
 static cmd_t CMDS[] = {
     {"help", "List commands", builtin_help},
@@ -100,8 +104,11 @@ static cmd_t CMDS[] = {
     {"env", "List environment", builtin_env},
     {"set", "Set NAME=VALUE", builtin_set},
     {"unset", "Unset NAME", builtin_unset},
+    {"exit", "Exit shell", builtin_exit},
+    {"export", "Export NAME=VALUE", builtin_export},
     {"hw", "Kernel info", builtin_hw},
     {"free", "Memory usage", builtin_free},
+    {"ui", "Launch simple UI", builtin_ui},
 };
 static const int CMDS_N = sizeof(CMDS) / sizeof(CMDS[0]);
 
@@ -437,60 +444,260 @@ static int read_line_mux(char *buf, int max)
     }
 }
 
+// --- New tokenizer and command runner ---
+
+typedef struct
+{
+    char *argv[32];
+    int argc;
+    const char *out_redir;
+    int out_append;
+    const char *in_redir;
+} parsed_cmd_t;
+
+static void parse_command_line(char *line, parsed_cmd_t *pc)
+{
+    pc->argc = 0;
+    pc->out_redir = 0;
+    pc->out_append = 0;
+    pc->in_redir = 0;
+    // Detect redirections
+    char *p = line;
+    char *last_space = 0;
+    while (*p)
+    {
+        if (*p == ' ')
+            last_space = p;
+        if (*p == '<')
+        {
+            *p = '\0';
+            char *f = p + 1;
+            while (*f == ' ')
+                f++;
+            pc->in_redir = f;
+            break;
+        }
+        if (*p == '>')
+        {
+            int append = 0;
+            if (p[1] == '>')
+            {
+                append = 1;
+                p++;
+            }
+            *p = '\0';
+            char *f = p + 1;
+            while (*f == ' ')
+                f++;
+            pc->out_redir = f;
+            pc->out_append = append;
+            break;
+        }
+        p++;
+    }
+    // If redirections found, use the part before
+    char *cmd_part = line;
+    if (pc->in_redir || pc->out_redir)
+    {
+        if (last_space)
+            *last_space = '\0';
+    }
+    // Tokenize cmd_part respecting quotes
+    p = cmd_part;
+    while (*p && pc->argc < 31)
+    {
+        while (*p == ' ')
+            p++;
+        if (!*p)
+            break;
+        char *start = p;
+        int quote = 0;
+        if (*p == '"' || *p == '\'')
+        {
+            quote = *p;
+            start = ++p;
+        }
+        while (*p && ((quote && *p != quote) || (!quote && *p != ' ')))
+            p++;
+        if (quote && *p == quote)
+        {
+            *p = '\0';
+            p++;
+        }
+        else if (!quote && *p)
+        {
+            *p = '\0';
+            p++;
+        }
+        pc->argv[pc->argc++] = start;
+    }
+    pc->argv[pc->argc] = 0;
+}
+
+static int run_builtin(parsed_cmd_t *pc)
+{
+    if (pc->argc == 0)
+        return 1; // nothing
+    for (int i = 0; i < CMDS_N; i++)
+    {
+        if (kstrcmp(pc->argv[0], CMDS[i].name) == 0)
+        {
+            char args_buf[256];
+            args_buf[0] = '\0';
+            if (pc->argc > 1)
+            {
+                int pos = 0;
+                for (int a = 1; a < pc->argc; a++)
+                {
+                    char *s = pc->argv[a];
+                    for (int k = 0; s[k] && pos < (int)sizeof(args_buf) - 2; k++)
+                        args_buf[pos++] = s[k];
+                    if (a + 1 < pc->argc && pos < (int)sizeof(args_buf) - 1)
+                        args_buf[pos++] = ' ';
+                }
+                args_buf[pos] = '\0';
+            }
+            if (pc->out_redir)
+            {
+                node_t *f = fs_create_file(fs_cwd(), pc->out_redir);
+                if (!f)
+                {
+                    kputs("redir error\n");
+                    return 1;
+                }
+                redir_len = 0;
+                kputc_fn prev = kprint_set_sink(redir_sink_char);
+                CMDS[i].fn(args_buf);
+                kprint_set_sink(prev);
+                fs_write(f, redir_buf, redir_len, pc->out_append);
+            }
+            else
+            {
+                CMDS[i].fn(pc->argc > 1 ? args_buf : (char *)"");
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+extern long sys_execve(const char *path, char *const argv[], char *const envp[]);
+static void run_external(parsed_cmd_t *pc)
+{
+    if (pc->argc == 0)
+        return;
+    int saved_stdout = -1;
+    int saved_stdin = -1;
+    if (pc->in_redir)
+    {
+        int fd = sys_open(pc->in_redir, 0, 0); // O_RDONLY
+        if (fd < 0)
+        {
+            kputs("cannot open input file\n");
+            return;
+        }
+        saved_stdin = sys_dup(0);
+        sys_dup2(fd, 0);
+        sys_close(fd);
+    }
+    if (pc->out_redir)
+    {
+        int fd = sys_open(pc->out_redir, 1 | 64 | (pc->out_append ? 1024 : 512), 0644); // O_WRONLY|O_CREAT|O_TRUNC/APPEND
+        if (fd < 0)
+        {
+            kputs("cannot open output file\n");
+            if (saved_stdin >= 0)
+            {
+                sys_dup2(saved_stdin, 0);
+                sys_close(saved_stdin);
+            }
+            return;
+        }
+        saved_stdout = sys_dup(1);
+        sys_dup2(fd, 1);
+        sys_close(fd);
+    }
+    const char *path = env_get("PATH");
+    if (!path || !*path)
+        path = "/bin";
+    char temp[128];
+    const char *seg = path;
+    const char *cur = path;
+    int attempted = 0;
+    while (1)
+    {
+        if (*cur == ':' || *cur == '\0')
+        {
+            size_t len = cur - seg;
+            if (len == 0)
+            {
+                seg = cur + (*cur ? 1 : 0);
+                cur++;
+                if (!*cur)
+                    break;
+                continue;
+            }
+            if (len > sizeof(temp) - 1)
+                len = sizeof(temp) - 1;
+            for (size_t i = 0; i < len; i++)
+                temp[i] = seg[i];
+            temp[len] = '\0';
+            // build candidate path temp + '/' + argv[0]
+            size_t pos = len;
+            if (pos && temp[pos - 1] != '/')
+                temp[pos++] = '/';
+            for (int k = 0; pc->argv[0][k] && pos < (int)sizeof(temp) - 1; k++)
+                temp[pos++] = pc->argv[0][k];
+            temp[pos] = '\0';
+            // try execve
+            long r = sys_execve(temp, pc->argv, 0);
+            if (r >= 0)
+            {
+                attempted = 1;
+                break;
+            }
+            if (*cur == '\0')
+                break;
+            seg = cur + 1;
+        }
+        if (*cur == '\0')
+            break;
+        else
+            cur++;
+    }
+    if (!attempted)
+    {
+        kputs("command not found\n");
+    }
+
+    if (saved_stdout >= 0)
+    {
+        sys_dup2(saved_stdout, 1);
+        sys_close(saved_stdout);
+    }
+    if (saved_stdin >= 0)
+    {
+        sys_dup2(saved_stdin, 0);
+        sys_close(saved_stdin);
+    }
+}
+
 void shell_run(void)
 {
     char line[256];
+    parsed_cmd_t pc;
     for (;;)
     {
         prompt();
         int n = read_line_mux(line, sizeof(line));
         if (n <= 0)
             continue;
-        char *file = 0;
-        int append = 0;
-        char *left = line;
-        parse_redir(line, &left, &file, &append);
-        char *cmd = left;
-        while (*cmd == ' ')
-            cmd++;
-        char *args = cmd;
-        while (*args && *args != ' ')
-            args++;
-        if (*args)
-        {
-            *args = '\0';
-            args++;
-            while (*args == ' ')
-                args++;
-        }
-        int handled = 0;
-        for (int i = 0; i < CMDS_N; i++)
-            if (kstrcmp(cmd, CMDS[i].name) == 0)
-            {
-                if (file)
-                {
-                    node_t *f = fs_create_file(fs_cwd(), file);
-                    if (!f)
-                    {
-                        kputs("redir error\n");
-                        handled = 1;
-                        break;
-                    }
-                    redir_len = 0;
-                    kputc_fn prev = kprint_set_sink(redir_sink_char);
-                    CMDS[i].fn(args && *args ? args : (char *)"");
-                    kprint_set_sink(prev);
-                    fs_write(f, redir_buf, redir_len, append);
-                }
-                else
-                {
-                    CMDS[i].fn(args && *args ? args : (char *)"");
-                }
-                handled = 1;
-                break;
-            }
-        if (!handled)
-            kputs("This command does not exist\n");
+        parse_command_line(line, &pc);
+        if (pc.argc == 0)
+            continue;
+        if (run_builtin(&pc))
+            continue;
+        run_external(&pc);
     }
 }
 
@@ -523,4 +730,41 @@ static void builtin_unset(char *args)
         kputs("unset failed\n");
     else
         env_save();
+}
+
+static void builtin_exit(char *args)
+{
+    (void)args;
+    sys_exit(0);
+}
+
+static void builtin_export(char *args)
+{
+    if (!args || !*args)
+    {
+        kputs("usage: export VAR=value\n");
+        return;
+    }
+    char *eq = kstrchr(args, '=');
+    if (!eq)
+    {
+        kputs("usage: export VAR=value\n");
+        return;
+    }
+    *eq = '\0';
+    char buf[256];
+    kstrcpy(buf, args);
+    kstrcat(buf, "=");
+    kstrcat(buf, eq + 1);
+    if (env_set(buf) != 0)
+        kputs("export failed\n");
+    else
+        env_save();
+}
+
+extern void ui_run(void);
+static void builtin_ui(char *args)
+{
+    (void)args;
+    ui_run();
 }

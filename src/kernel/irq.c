@@ -52,9 +52,10 @@ void irq_init(void)
 
     for (int i = 0; i < MAX_IRQ; i++)
         pic_set_mask(i);
-    pic_clear_mask(0);
-    pic_clear_mask(1);
-    kprintf("[irq] initialized (timer+keyboard unmasked)\n");
+    pic_clear_mask(0); /* timer */
+    pic_clear_mask(1); /* keyboard */
+    pic_clear_mask(12); /* mouse */
+    kprintf("[irq] initialized (timer+keyboard+mouse unmasked)\n");
 }
 
 void irq_ack(int irq) { pic_eoi(irq); }

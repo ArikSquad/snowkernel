@@ -30,6 +30,13 @@ int80_entry64:
     ; We'll assume arguments were placed like 32-bit: RAX=num, RBX=a1, RCX=a2, RDX=a3, RSI=a4, RDI=a5, R8=a6.
 
     ; Push a6..a1 then num for syscall_thunk(num,a1..a6)
+    ; Switch to kernel page table before handling syscall
+    extern vm_get_kernel_cr3
+    mov rcx, [rel vm_get_kernel_cr3]
+    ; vm_get_kernel_cr3 is a function; call it to get kernel cr3 into rax
+    call vm_get_kernel_cr3
+    mov rcx, rax
+    mov cr3, rcx
     push r8      ; a6
     push rdi     ; a5
     push rsi     ; a4

@@ -15,3 +15,8 @@ typedef unsigned int size_t;
 typedef int ptrdiff_t;
 
 typedef unsigned int wchar_t; /* placeholder */
+
+#ifndef _WINT_T
+#define _WINT_T
+typedef unsigned int wint_t; /* match newlib default underlying type */
+#endif

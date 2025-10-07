@@ -20,6 +20,7 @@ struct stat {
 
 #define S_IFDIR  0040000
 #define S_IFREG  0100000
+#define S_IFCHR  0020000
 #define S_IRUSR  0000400
 #define S_IWUSR  0000200
 #define S_IRGRP  0000040

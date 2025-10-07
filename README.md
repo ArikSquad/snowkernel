@@ -4,16 +4,18 @@ A tiny OS (well a kernel) that has a few commands. Inspired from DOS. Built with
 
 ## Build
 
-you need these for x86_32:
+You need these at least:
 - nasm
-- gcc or i686-elf-gcc
-- ld or i686-elf-ld
+- x86_64-elf-gcc (or a compatible cross-compiler)
+- x86_64-elf-ld (or a compatible linker)
 - grub-mkrescue (from grub and xorriso packages)
-- qemu-system-i386
+- qemu-system-x86_64
+
+Build and run:
 
 ```
+make newlib
+make userprogs
 make iso
 make run
 ```
-
-you can also run it on x86_64 with `make run ARCH=x86_64`

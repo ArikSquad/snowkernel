@@ -4,7 +4,8 @@
 typedef enum
 {
     NODE_DIR,
-    NODE_FILE
+    NODE_FILE,
+    NODE_CHAR
 } node_type_t;
 
 typedef struct node
@@ -25,6 +26,7 @@ void fs_set_cwd(node_t *n);
 node_t *fs_mkdir(node_t *parent, const char *name);
 node_t *fs_lookup(node_t *parent, const char *path);
 node_t *fs_create_file(node_t *parent, const char *name);
+node_t *fs_create_chardev(node_t *parent, const char *name, void *devptr);
 int fs_write(node_t *f, const char *data, size_t len, int append);
 int fs_read(node_t *f, char *out, size_t max);
 

@@ -11,62 +11,51 @@ static idt_ptr_t idtp;
 #define CODE_SELECTOR 0x08
 #endif
 
-#ifdef __SNOW_64__
 static void set_entry64(int vec, void (*handler)(void), uint8_t type_attr)
 {
+    if (vec < 0 || vec >= IDT_MAX) return;
     uintptr_t addr = (uintptr_t)handler;
-    idt[vec].offset_low = addr & 0xFFFF;
-    idt[vec].selector = CODE_SELECTOR;
-    idt[vec].ist = 0;
-    idt[vec].type_attr = type_attr; // present=1, DPL, type=0xE interrupt gate
-    idt[vec].offset_mid = (addr >> 16) & 0xFFFF;
+#ifdef __SNOW_64__
+    idt[vec].offset_low  = addr & 0xFFFF;
+    idt[vec].selector    = CODE_SELECTOR;
+    idt[vec].ist         = 0;
+    idt[vec].type_attr   = type_attr;
+    idt[vec].offset_mid  = (addr >> 16) & 0xFFFF;
     idt[vec].offset_high = (uint32_t)((addr >> 32) & 0xFFFFFFFF);
-    idt[vec].zero = 0;
-}
+    idt[vec].zero        = 0;
 #else
-static void set_entry32(int vec, void (*handler)(void), uint8_t type_attr)
-{
-    uintptr_t addr = (uintptr_t)handler;
-    idt[vec].offset_low = addr & 0xFFFF;
-    idt[vec].selector = CODE_SELECTOR;
-    idt[vec].zero = 0;
-    idt[vec].type_attr = type_attr;
+    /* 32-bit layout though we don't really support it anymore */
+    idt[vec].offset_low  = addr & 0xFFFF;
+    idt[vec].selector    = CODE_SELECTOR;
+    idt[vec].zero        = 0;
+    idt[vec].type_attr   = type_attr;
     idt[vec].offset_high = (addr >> 16) & 0xFFFF;
-}
 #endif
+}
 
 void idt_set_gate(int vec, void (*handler)(void), uint8_t type_attr)
 {
-    if (vec < 0 || vec >= IDT_MAX)
-        return;
-#ifdef __SNOW_64__
     set_entry64(vec, handler, type_attr);
-#else
-    set_entry32(vec, handler, type_attr);
-#endif
 }
 
 static void default_isr(void)
 {
-    kprintf("[idt] Unhandled interrupt\n");
-    for (;;)
-    {
-        __asm__ __volatile__("hlt");
-    }
+    kprintf("[idt] Unhandled interrupt (continuing)\n");
+    /* TODO: make proper handling */
 }
-
-extern void int80_entry(void);   // 32-bit syscall entry
-extern void int80_entry64(void); // will be provided for x86_64
 
 void idt_init(void)
 {
     for (int i = 0; i < IDT_MAX; i++)
         idt_set_gate(i, default_isr, 0x8E);
-#ifndef __SNOW_64__
-    idt_set_gate(0x80, (void *)int80_entry, 0xEE); // DPL=3 (0xE | 0x60) + present
-#else
+    extern void int80_entry64(void);
     idt_set_gate(0x80, (void *)int80_entry64, 0xEE); // user-callable
-#endif
+    /* do a simple #UD handler (vector 6) to report invalid opcode, often
+       triggered by unsupported SYSCALL instruction in foreign ELF binaries. */
+    extern void invalid_opcode_isr(void);
+    idt_set_gate(6, invalid_opcode_isr, 0x8E);
+    extern void page_fault_isr(void);
+    idt_set_gate(14, page_fault_isr, 0x8E);
     idtp.limit = sizeof(idt) - 1;
     idtp.base = (uintptr_t)&idt[0];
     __asm__ __volatile__("lidt (%0)" ::"r"(&idtp));

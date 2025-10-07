@@ -5,8 +5,6 @@ bits 32
 int80_entry:
     pusha
     xor ebp, ebp
-    ; after pusha, stack layout: original esp-> (edi,esi,ebp,esp_saved,ebx,edx,ecx,eax)
-    ; expect syscall number in eax, args in ebx, ecx, edx, esi, edi, (none for 6th yet)
     mov eax, [esp+28] ; saved eax
     mov ebx, [esp+36] ; saved ebx
     mov ecx, [esp+24] ; saved ecx

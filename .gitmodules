@@ -1,0 +1,6 @@
+[submodule "lib/coreutils"]
+	path = lib/coreutils
+	url = https://github.com/uutils/coreutils
+[submodule "lib/newlib"]
+	path = lib/newlib
+	url = https://github.com/bminor/newlib

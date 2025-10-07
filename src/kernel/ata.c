@@ -42,7 +42,7 @@ static int ata_wait_drq(void)
 int ata_read28(uint32_t lba, void *buf)
 {
     if (lba & 0xF0000000)
-        return -1; // only 28-bit
+        return -1;
     outb(ATA_IO_BASE + ATA_REG_HDDEVSEL, 0xE0 | ((lba >> 24) & 0x0F));
     outb(ATA_IO_BASE + ATA_REG_SECCOUNT0, 1);
     outb(ATA_IO_BASE + ATA_REG_LBA0, (uint8_t)(lba));

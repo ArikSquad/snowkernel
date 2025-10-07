@@ -1,6 +1,7 @@
 #include "keyboard.h"
-#include "kprint.h"
+#include "../kernel/kprint.h"
 #include "keymap.h"
+#include "../kernel/tty.h"
 #include <stdint.h>
 
 static inline uint8_t inb(uint16_t port)
@@ -69,3 +70,13 @@ int kbd_read_line(char *buf, int max)
 }
 
 int kbd_getc_nonblock(void) { return keymap_get_char(); }
+
+/* Poll & drain available characters to active tty (call from IRQ handler later) */
+void kbd_drain_to_tty(void)
+{
+    int ch;
+    while ((ch = keymap_get_char()) >= 0)
+    {
+        tty_kbd_putc((char)ch);
+    }
+}

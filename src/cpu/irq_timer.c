@@ -1,5 +1,5 @@
 #include "irq.h"
-#include "kprint.h"
+#include "../kernel/kprint.h"
 #include <stdint.h>
 
 volatile uint64_t ticks = 0;
