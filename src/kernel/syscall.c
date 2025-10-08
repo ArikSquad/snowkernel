@@ -151,10 +151,12 @@ long sys_execve(const char *path, char *const argv[], char *const envp[])
     (void)envp;
     if (!path || !*path)
         return -1;
+    
     node_t *cwd = fs_cwd();
     node_t *n = fs_lookup(cwd, path);
     if (!n || n->type != NODE_FILE)
         return -1;
+    
     kprintf("[execve] start path='%s' size=%u\n", path, (unsigned)n->size);
 
     /* Inspect ELF without mapping into kernel address space */
@@ -165,157 +167,198 @@ long sys_execve(const char *path, char *const argv[], char *const envp[])
         kprintf("[execve] not a valid ELF (%s)\n", path);
         return -1;
     }
-    kprintf("[execve] ELF entry=%x segs=%d\n", (unsigned)entry, seg_count);
+    kprintf("[execve] ELF entry=%lx segs=%d\n", (unsigned long)entry, seg_count);
     if (seg_count >= 16) {
         kprintf("[execve] too many segments (>%d) unsupported\n", 16);
         return -1;
     }
-    /* Basic feature rejection: look for PT_INTERP or dynamic / unsupported flags */
+    
+    /* Validate ELF header */
     const Elf64_Ehdr *ehdr = (const Elf64_Ehdr*)n->data;
     const unsigned char *baseptr_img = (const unsigned char*)n->data;
-    /* Sanity checks on program header table before iterating */
+    
     if (ehdr->e_phentsize < sizeof(Elf64_Phdr)) {
         kprintf("[execve] e_phentsize=%u < sizeof(Phdr) -> reject\n", (unsigned)ehdr->e_phentsize);
         return -1;
     }
+    
     uint64_t ph_table_bytes = (uint64_t)ehdr->e_phentsize * ehdr->e_phnum;
-    if (ehdr->e_phoff > n->size || ph_table_bytes > n->size || ehdr->e_phoff + ph_table_bytes > n->size) {
-        kprintf("[execve] ph table out of range: off=%x size=%x total=%x img=%x -> reject\n",
-                (unsigned)ehdr->e_phoff, (unsigned)ph_table_bytes, (unsigned)(ehdr->e_phoff + ph_table_bytes), (unsigned)n->size);
+    if (ehdr->e_phoff > n->size || ph_table_bytes > n->size || 
+        ehdr->e_phoff + ph_table_bytes > n->size) {
+        kprintf("[execve] ph table out of range\n");
         return -1;
     }
-    kprintf("[execve] phoff=%x phentsz=%u phnum=%u (table_bytes=%x)\n", (unsigned)ehdr->e_phoff, (unsigned)ehdr->e_phentsize, (unsigned)ehdr->e_phnum, (unsigned)ph_table_bytes);
-    int saw_interp = 0, saw_dynamic = 0; 
-    for (uint16_t i=0;i<ehdr->e_phnum;i++) {
+    
+    /* Check for unsupported features */
+    int saw_interp = 0, saw_dynamic = 0;
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
         const uint64_t ph_off = ehdr->e_phoff + (uint64_t)i * ehdr->e_phentsize;
         const Elf64_Phdr *ph = (const Elf64_Phdr*)(baseptr_img + ph_off);
         if (ph_off + sizeof(Elf64_Phdr) > n->size) {
-            kprintf("[execve] ph[%u] truncated (off=%x) -> stop\n", (unsigned)i, (unsigned)ph_off);
+            kprintf("[execve] ph[%u] truncated\n", (unsigned)i);
             break;
         }
-        kprintf("[execve] ph[%u] type=%x off=%x vaddr=%x filesz=%x memsz=%x flags=%x align=%x\n",
-                (unsigned)i, (unsigned)ph->p_type, (unsigned)ph->p_offset, (unsigned)ph->p_vaddr,
-                (unsigned)ph->p_filesz, (unsigned)ph->p_memsz, (unsigned)ph->p_flags, (unsigned)ph->p_align);
-        if (ph->p_type == PT_INTERP) { saw_interp = 1; }
-        else if (ph->p_type == PT_DYNAMIC) { saw_dynamic = 1; }
+        if (ph->p_type == PT_INTERP) saw_interp = 1;
+        else if (ph->p_type == PT_DYNAMIC) saw_dynamic = 1;
     }
+    
     if (saw_interp) {
-        kprintf("[execve] PT_INTERP present -> dynamic binary unsupported (reject)\n");
+        kprintf("[execve] PT_INTERP present -> dynamic binary unsupported\n");
         return -1;
     }
     if (saw_dynamic) {
-        kprintf("[execve] PT_DYNAMIC present -> dynamic/reloc binary unsupported (reject)\n");
-        return -1;
-    }
-    /* Light scan for 64-bit SYSCALL instruction (0x0F 0x05). If present, warn: we only implement int 0x80 path. */
-    int found_syscall = 0;
-    const unsigned char *scan = (const unsigned char*)n->data;
-    for (size_t i=0;i+1<n->size && i<4096; i++) { /* limit scan for speed */
-        if (scan[i]==0x0F && scan[i+1]==0x05) { found_syscall=1; break; }
-    }
-    if (found_syscall) {
-        kprintf("[execve] WARNING: binary uses SYSCALL instruction (unsupported) -> abort\n");
+        kprintf("[execve] PT_DYNAMIC present -> dynamic binary unsupported\n");
         return -1;
     }
 
-    /* Reset brk tracking for this process (fresh image). */
+    /* Reset brk tracking for this process (fresh image) */
     process_t *pc = proc_current();
-    if (pc) { pc->brk_start = 0; pc->brk_curr = 0; }
+    if (!pc) return -1;
+    
+    pc->brk_start = 0;
+    pc->brk_curr = 0;
+    pc->image_hi = 0;
 
+    /* Clone page table to preserve kernel mappings */
     uint64_t new_pml4 = vm_clone_current_pml4();
-    if (!new_pml4)
-    {
+    if (!new_pml4) {
         kprintf("[execve] vm clone failed\n");
         return -1;
     }
 
-    /* Preserve kernel mappings so syscalls/IRQs can function after user entry. */
-
-    /* Map & load segments explicitly using inspected metadata */
-    for (int si=0; si<seg_count; si++) {
+    /* Map and load segments */
+    for (int si = 0; si < seg_count; si++) {
         uintptr_t vaddr_aligned = segs[si].vaddr & ~0xFFFULL;
         uintptr_t delta = segs[si].vaddr - vaddr_aligned;
-        uintptr_t filesz = segs[si].filesz + delta; /* include leading delta in first page copy logic */
+        uintptr_t filesz = segs[si].filesz + delta;
         uintptr_t memsz = segs[si].memsz + delta;
-        uintptr_t num_pages = (memsz + 4095)/4096;
+        uintptr_t num_pages = (memsz + 4095) / 4096;
+        
         uint64_t flags = PTE_PRESENT | PTE_USER | PTE_WRITABLE;
         if (!(segs[si].flags & PF_W)) flags &= ~PTE_WRITABLE;
-        kprintf("[execve] seg %d vaddr=%x mem=%x file=%x pages=%u flags=%x\n",
-                si, (unsigned)segs[si].vaddr, (unsigned)segs[si].memsz, (unsigned)segs[si].filesz,
-                (unsigned)num_pages, (unsigned)flags);
-        for (uintptr_t p=0; p<num_pages; p++) {
+        
+        kprintf("[execve] seg %d vaddr=%lx mem=%lx file=%lx pages=%lu flags=%lx\n",
+                si, (unsigned long)segs[si].vaddr, (unsigned long)segs[si].memsz,
+                (unsigned long)segs[si].filesz, (unsigned long)num_pages, 
+                (unsigned long)flags);
+        
+        for (uintptr_t p = 0; p < num_pages; p++) {
             void *phys = pmm_alloc_page();
-            if (!phys) { kprintf("[execve] pmm alloc failed seg=%d page=%u\n", si, (unsigned)p); return -1; }
-            uintptr_t page_offset = p*4096;
-            for (int z=0; z<4096; z++) ((char*)phys)[z]=0; /* pre-zero */
-            /* copy portion overlapping file */
+            if (!phys) {
+                kprintf("[execve] pmm alloc failed seg=%d page=%lu\n", si, (unsigned long)p);
+                return -1;
+            }
+            
+            /* Zero the page */
+            for (int z = 0; z < 4096; z++) 
+                ((char*)phys)[z] = 0;
+            
+            /* Copy file data if any */
+            uintptr_t page_offset = p * 4096;
             if (page_offset < filesz) {
-                uintptr_t copy = filesz - page_offset; if (copy>4096) copy=4096;
+                uintptr_t copy = filesz - page_offset;
+                if (copy > 4096) copy = 4096;
                 kmemcpy((char*)phys, (char*)n->data + segs[si].offset + page_offset - delta, copy);
             }
-            vm_map_page_pml4(new_pml4, vaddr_aligned + p*4096, (uint64_t)phys, flags);
+            
+            vm_map_page_pml4(new_pml4, vaddr_aligned + p * 4096, (uint64_t)phys, flags);
             proc_add_allocated_page((uint64_t)phys);
         }
-        /* Track high watermark for heap placement */
+        
+        /* Track highest address for heap placement */
         uintptr_t seg_end = segs[si].vaddr + segs[si].memsz;
-        if (pc && seg_end > pc->image_hi) pc->image_hi = seg_end;
+        if (seg_end > pc->image_hi) 
+            pc->image_hi = seg_end;
     }
 
+    /* Allocate user stack */
     const uintptr_t USER_STACK_TOP = 0x7FFFFFF0000ULL;
     void *ustack_phys = pmm_alloc_page();
-    if (!ustack_phys)
-    {
+    if (!ustack_phys) {
         kprintf("[execve] stack alloc failed\n");
         return -1;
     }
-    vm_map_page_pml4(new_pml4, USER_STACK_TOP - 4096, (uint64_t)ustack_phys, PTE_PRESENT | PTE_USER | PTE_WRITABLE);
+    
+    vm_map_page_pml4(new_pml4, USER_STACK_TOP - 4096, (uint64_t)ustack_phys, 
+                     PTE_PRESENT | PTE_USER | PTE_WRITABLE);
     proc_add_allocated_page((uint64_t)ustack_phys);
 
     proc_set_pml4(new_pml4);
     proc_add_allocated_page(new_pml4);
 
+    /* Map kernel stack */
     uint64_t cur_rsp_k;
     __asm__ volatile("mov %%rsp, %0" : "=r"(cur_rsp_k));
     uint64_t kstack_page = cur_rsp_k & ~0xFFFULL;
     vm_map_page_pml4(new_pml4, kstack_page, kstack_page, PTE_PRESENT | PTE_WRITABLE);
 
+    /* Save return point */
     uint64_t cur_rsp;
     __asm__ volatile("mov %%rsp, %0" : "=r"(cur_rsp));
-    process_t *curp = proc_current();
-    if (curp)
-    {
-        curp->kernel_saved_rsp = cur_rsp;
-        curp->kernel_saved_rip = (uint64_t)&&after_enter;
+    if (pc) {
+        pc->kernel_saved_rsp = cur_rsp;
+        pc->kernel_saved_rip = (uint64_t)&&after_enter;
     }
 
 after_enter:;
-    kprintf("[execve] prepared user image %s entry=%x pml4=%x\n", path, (unsigned)entry, (unsigned)new_pml4);
-    uint64_t user_sp = USER_STACK_TOP;
-    uint64_t str_off = 0x100;
+    /* Setup user stack with argc/argv */
     char *phys_stack = (char *)ustack_phys;
-    size_t alen = 0;
-    while (path[alen])
-        alen++;
-    if (alen + 1 > 4096 - str_off)
-        return -1;
-
-    for (size_t i = 0; i <= alen; i++)
-        phys_stack[str_off + i] = path[i];
-    uint64_t arg0_vaddr = (USER_STACK_TOP - 4096) + str_off;
-    user_sp -= 8; /* argv NULL terminator */
-    uint64_t argv0_ptr_slot = user_sp - 8;
-    user_sp = argv0_ptr_slot;
-    uint64_t ptr_off = (uint64_t)(argv0_ptr_slot - (USER_STACK_TOP - 4096));
-    if (ptr_off + 8 > 4096)
-        return -1;
-    *(uint64_t *)((char *)ustack_phys + ptr_off) = arg0_vaddr;
-    uint64_t null_off = (uint64_t)(user_sp + 8 - (USER_STACK_TOP - 4096));
-    if (null_off + 8 <= 4096)
-        *(uint64_t *)((char *)ustack_phys + null_off) = 0;
-    user_sp &= ~0xFULL;
-    kprintf("[execve] entering user entry=%x sp=%x pml4=%x (final)\n", (unsigned)entry, (unsigned)user_sp, (unsigned)new_pml4);
+    uint64_t user_sp = USER_STACK_TOP;
+    
+    /* Count argc */
+    int argc = 0;
+    if (argv) {
+        while (argv[argc] != 0) argc++;
+    }
+    if (argc == 0) argc = 1;  /* At least program name */
+    
+    /* Copy argv strings to stack */
+    uint64_t str_area = 0x100;  /* Start at offset 0x100 */
+    uint64_t argv_ptrs[32];     /* Max 32 args */
+    int arg_count = 0;
+    
+    if (argv && argv[0]) {
+        for (int i = 0; i < argc && i < 32; i++) {
+            const char *arg = argv[i];
+            size_t len = 0;
+            while (arg[len]) len++;
+            
+            if (str_area + len + 1 > 4096) break;
+            
+            for (size_t j = 0; j <= len; j++)
+                phys_stack[str_area + j] = arg[j];
+            
+            argv_ptrs[arg_count++] = (USER_STACK_TOP - 4096) + str_area;
+            str_area += len + 1;
+        }
+    } else {
+        /* Default to program name */
+        size_t len = 0;
+        while (path[len]) len++;
+        if (str_area + len + 1 <= 4096) {
+            for (size_t j = 0; j <= len; j++)
+                phys_stack[str_area + j] = path[j];
+            argv_ptrs[arg_count++] = (USER_STACK_TOP - 4096) + str_area;
+        }
+    }
+    
+    /* Build argv array on stack */
+    user_sp -= 8;  /* NULL terminator */
+    for (int i = arg_count - 1; i >= 0; i--) {
+        user_sp -= 8;
+        uint64_t ptr_off = user_sp - (USER_STACK_TOP - 4096);
+        if (ptr_off + 8 <= 4096)
+            *(uint64_t *)(phys_stack + ptr_off) = argv_ptrs[i];
+    }
+    
+    uint64_t argv_addr = user_sp;
+    user_sp &= ~0xFULL;  /* Align to 16 bytes */
+    
+    kprintf("[execve] entering user entry=%lx sp=%lx argc=%d\n", 
+            (unsigned long)entry, (unsigned long)user_sp, arg_count);
+    
     enter_user(entry, user_sp, new_pml4);
-    kprintf("[execve] ERROR: returned from enter_user (aborting exec)\n");
+    kprintf("[execve] ERROR: returned from enter_user\n");
     return -1;
 }
 
