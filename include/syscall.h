@@ -10,13 +10,13 @@ enum
     SYS_stat = 4,
     SYS_fstat = 5,
     SYS_lseek = 8,
+    SYS_brk = 12,
     SYS_pipe = 22,
     SYS_dup = 32,
     SYS_dup2 = 33,
     SYS_fork = 57,
     SYS_execve = 59,
     SYS_exit = 60,
-    SYS_brk = 12,
 };
 
 long sys_read(int fd, void *buf, unsigned long count);
