@@ -462,8 +462,288 @@ long sys_brk(void *addr)
     return (long)p->brk_curr;
 }
 
+/* Process identification syscalls */
+long sys_getpid(void)
+{
+    process_t *p = proc_current();
+    return p ? p->pid : 1;
+}
+
+long sys_getppid(void)
+{
+    process_t *p = proc_current();
+    if (!p || !p->parent) return 0;
+    return p->parent->pid;
+}
+
+/* User/Group ID syscalls - simplified (always return 0 for root) */
+long sys_getuid(void) { return 0; }
+long sys_getgid(void) { return 0; }
+long sys_geteuid(void) { return 0; }
+long sys_getegid(void) { return 0; }
+
+/* Directory operation syscalls */
+long sys_chdir(const char *path)
+{
+    if (!path) return -1;
+    node_t *cwd = fs_cwd();
+    node_t *n = fs_lookup(cwd, path);
+    if (!n || n->type != NODE_DIR) return -1;
+    fs_set_cwd(n);
+    return 0;
+}
+
+long sys_getcwd(char *buf, unsigned long size)
+{
+    if (!buf || size == 0) return -1;
+    node_t *cwd = fs_cwd();
+    if (!cwd) {
+        if (size >= 2) {
+            buf[0] = '/';
+            buf[1] = '\0';
+        }
+        return (long)buf;
+    }
+    
+    /* Build path backwards from cwd to root */
+    char tmp[256];
+    int pos = 255;
+    tmp[pos] = '\0';
+    
+    node_t *n = cwd;
+    while (n && n->parent) {
+        int len = 0;
+        while (n->name[len]) len++;
+        if (pos - len - 1 < 0) return -1; /* path too long */
+        pos -= len;
+        for (int i = 0; i < len; i++) tmp[pos + i] = n->name[i];
+        pos--;
+        tmp[pos] = '/';
+        n = n->parent;
+    }
+    
+    if (pos == 255) { /* root directory */
+        if (size >= 2) {
+            buf[0] = '/';
+            buf[1] = '\0';
+        }
+        return (long)buf;
+    }
+    
+    /* Copy result to user buffer */
+    unsigned long len = 255 - pos;
+    if (len + 1 > size) return -1; /* buffer too small */
+    for (unsigned long i = 0; i <= len; i++) {
+        buf[i] = tmp[pos + i];
+    }
+    return (long)buf;
+}
+
+long sys_mkdir(const char *path, int mode)
+{
+    (void)mode; /* ignore mode for now */
+    if (!path) return -1;
+    node_t *cwd = fs_cwd();
+    
+    /* Check if already exists */
+    node_t *existing = fs_lookup(cwd, path);
+    if (existing) return -1; /* already exists */
+    
+    /* Simple path handling - extract parent and name */
+    const char *last_slash = path;
+    const char *p = path;
+    while (*p) {
+        if (*p == '/') last_slash = p;
+        p++;
+    }
+    
+    node_t *parent = cwd;
+    const char *name = path;
+    
+    if (last_slash != path) {
+        /* Need to navigate to parent directory */
+        char parent_path[256];
+        int len = last_slash - path;
+        if (len >= 256) return -1;
+        for (int i = 0; i < len; i++) parent_path[i] = path[i];
+        parent_path[len] = '\0';
+        parent = fs_lookup(cwd, parent_path);
+        if (!parent || parent->type != NODE_DIR) return -1;
+        name = last_slash + 1;
+    } else if (*path == '/') {
+        parent = fs_root();
+        name = path + 1;
+    }
+    
+    node_t *new_dir = fs_mkdir(parent, name);
+    return new_dir ? 0 : -1;
+}
+
+long sys_rmdir(const char *path)
+{
+    if (!path) return -1;
+    node_t *cwd = fs_cwd();
+    node_t *n = fs_lookup(cwd, path);
+    if (!n || n->type != NODE_DIR) return -1;
+    if (n->child) return -1; /* directory not empty */
+    
+    /* Extract parent and name */
+    const char *last_slash = path;
+    const char *p = path;
+    while (*p) {
+        if (*p == '/') last_slash = p;
+        p++;
+    }
+    
+    node_t *parent = n->parent ? n->parent : cwd;
+    const char *name = (last_slash != path) ? last_slash + 1 : path;
+    
+    return fs_unlink(parent, name) ? 0 : -1;
+}
+
+long sys_unlink(const char *path)
+{
+    if (!path) return -1;
+    node_t *cwd = fs_cwd();
+    node_t *n = fs_lookup(cwd, path);
+    if (!n || n->type == NODE_DIR) return -1; /* can't unlink directories */
+    
+    /* Extract parent and name */
+    const char *last_slash = path;
+    const char *p = path;
+    while (*p) {
+        if (*p == '/') last_slash = p;
+        p++;
+    }
+    
+    node_t *parent = n->parent ? n->parent : cwd;
+    const char *name = (last_slash != path) ? last_slash + 1 : path;
+    
+    return fs_unlink(parent, name) ? 0 : -1;
+}
+
+long sys_rename(const char *oldpath, const char *newpath)
+{
+    if (!oldpath || !newpath) return -1;
+    node_t *cwd = fs_cwd();
+    node_t *old = fs_lookup(cwd, oldpath);
+    if (!old) return -1;
+    
+    /* Extract parent and names */
+    const char *new_last_slash = newpath;
+    const char *p = newpath;
+    while (*p) {
+        if (*p == '/') new_last_slash = p;
+        p++;
+    }
+    
+    const char *old_last_slash = oldpath;
+    p = oldpath;
+    while (*p) {
+        if (*p == '/') old_last_slash = p;
+        p++;
+    }
+    
+    node_t *old_parent = old->parent ? old->parent : cwd;
+    const char *old_name = (old_last_slash != oldpath) ? old_last_slash + 1 : oldpath;
+    const char *new_name = (new_last_slash != newpath) ? new_last_slash + 1 : newpath;
+    
+    /* Use fs_rename if same parent, otherwise more complex */
+    return fs_rename(old_parent, old_name, new_name);
+}
+
+long sys_access(const char *path, int mode)
+{
+    (void)mode; /* simplified - just check if file exists */
+    if (!path) return -1;
+    node_t *cwd = fs_cwd();
+    node_t *n = fs_lookup(cwd, path);
+    return n ? 0 : -1;
+}
+
+/* Directory reading - simplified implementation */
+long sys_readdir(int fd, void *dirp, unsigned int count)
+{
+    (void)fd;
+    (void)dirp;
+    (void)count;
+    return -1; /* not yet implemented */
+}
+
+/* File control operations */
+long sys_fcntl(int fd, int cmd, long arg)
+{
+    fd_entry_t *e = proc_get_fd(fd);
+    if (!e) return -1;
+    
+    /* Simplified - handle basic commands */
+    switch (cmd) {
+        case 0: /* F_DUPFD */
+            return sys_dup(fd);
+        case 1: /* F_GETFD */
+            return 0; /* no close-on-exec flag set */
+        case 2: /* F_SETFD */
+            (void)arg;
+            return 0;
+        case 3: /* F_GETFL */
+            return e->flags;
+        case 4: /* F_SETFL */
+            e->flags = (int)arg;
+            return 0;
+        default:
+            return -1;
+    }
+}
+
+long sys_ioctl(int fd, unsigned long request, unsigned long arg)
+{
+    (void)fd;
+    (void)request;
+    (void)arg;
+    return -1; /* simplified - not implemented */
+}
+
+long sys_umask(int mask)
+{
+    process_t *p = proc_current();
+    (void)p;
+    (void)mask;
+    return 0022; /* default umask */
+}
+
+/* Time syscalls - simplified */
+long sys_time(long *tloc)
+{
+    long t = 0; /* no real time tracking yet */
+    if (tloc) *tloc = t;
+    return t;
+}
+
+long sys_gettimeofday(void *tv, void *tz)
+{
+    (void)tz;
+    if (!tv) return -1;
+    struct {
+        long tv_sec;
+        long tv_usec;
+    } *timeval = tv;
+    timeval->tv_sec = 0;
+    timeval->tv_usec = 0;
+    return 0;
+}
+
+/* Process control */
+long sys_waitpid(int pid, int *status, int options)
+{
+    (void)pid;
+    (void)options;
+    if (status) *status = 0;
+    return -1; /* no child processes yet */
+}
+
 long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5, long a6)
 {
+    (void)a4;
     (void)a5;
     (void)a6;
     switch (num)
@@ -496,6 +776,46 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5, lon
         return sys_exit((int)a1);
     case SYS_brk:
         return sys_brk((void*)a1);
+    case SYS_getpid:
+        return sys_getpid();
+    case SYS_getppid:
+        return sys_getppid();
+    case SYS_getuid:
+        return sys_getuid();
+    case SYS_getgid:
+        return sys_getgid();
+    case SYS_geteuid:
+        return sys_geteuid();
+    case SYS_getegid:
+        return sys_getegid();
+    case SYS_chdir:
+        return sys_chdir((const char *)a1);
+    case SYS_getcwd:
+        return sys_getcwd((char *)a1, (unsigned long)a2);
+    case SYS_mkdir:
+        return sys_mkdir((const char *)a1, (int)a2);
+    case SYS_rmdir:
+        return sys_rmdir((const char *)a1);
+    case SYS_unlink:
+        return sys_unlink((const char *)a1);
+    case SYS_rename:
+        return sys_rename((const char *)a1, (const char *)a2);
+    case SYS_access:
+        return sys_access((const char *)a1, (int)a2);
+    case SYS_readdir:
+        return sys_readdir((int)a1, (void *)a2, (unsigned int)a3);
+    case SYS_fcntl:
+        return sys_fcntl((int)a1, (int)a2, a3);
+    case SYS_ioctl:
+        return sys_ioctl((int)a1, (unsigned long)a2, (unsigned long)a3);
+    case SYS_umask:
+        return sys_umask((int)a1);
+    case SYS_time:
+        return sys_time((long *)a1);
+    case SYS_gettimeofday:
+        return sys_gettimeofday((void *)a1, (void *)a2);
+    case SYS_waitpid:
+        return sys_waitpid((int)a1, (int *)a2, (int)a3);
     default:
         return -1;
     }

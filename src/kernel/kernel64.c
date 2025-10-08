@@ -314,6 +314,11 @@ void kernel_main64(void)
     fs_init();
     kprintf("[fs] fs_init() done\n");
     fs_mkdir(fs_root(), "home");
+    
+    /* Initialize /proc filesystem */
+    extern void procfs_init(void);
+    procfs_init();
+    
     tty_init();
     tty_register_fs();
     kprintf("[tty] initialized /dev/tty0\n");
