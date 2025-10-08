@@ -1,6 +1,16 @@
 # Snow Kernel
 A tiny OS (well a kernel) that has a few commands. Inspired from DOS. Built with modern standards, or at least tries to achieve that.
 
+## Features
+
+- **POSIX-like System Calls**: Implements many standard POSIX syscalls for file I/O, process management, directory operations, and more
+- **/proc Filesystem**: Basic `/proc` filesystem for system information (`/proc/meminfo`, `/proc/cpuinfo`, etc.)
+- **Newlib Integration**: Full integration with newlib C library for userland applications
+- **x86-64 Architecture**: 64-bit kernel with support for user-mode programs
+- **Virtual Filesystem**: In-memory filesystem with support for files, directories, and character devices
+- **TTY Support**: Terminal I/O with `/dev/tty0`
+
+For details on available system calls, see [SYSCALLS.md](SYSCALLS.md).
 
 ## Build
 
