@@ -351,7 +351,6 @@ after_enter:;
             *(uint64_t *)(phys_stack + ptr_off) = argv_ptrs[i];
     }
     
-    uint64_t argv_addr = user_sp;
     user_sp &= ~0xFULL;  /* Align to 16 bytes */
     
     kprintf("[execve] entering user entry=%lx sp=%lx argc=%d\n", 
@@ -519,11 +518,30 @@ long sys_getppid(void)
     return p->parent->pid;
 }
 
-/* User/Group ID syscalls - simplified (always return 0 for root) */
-long sys_getuid(void) { return 0; }
-long sys_getgid(void) { return 0; }
-long sys_geteuid(void) { return 0; }
-long sys_getegid(void) { return 0; }
+/* User/Group ID syscalls - use real process data */
+long sys_getuid(void)
+{
+    process_t *p = proc_current();
+    return p ? p->uid : 0;
+}
+
+long sys_getgid(void)
+{
+    process_t *p = proc_current();
+    return p ? p->gid : 0;
+}
+
+long sys_geteuid(void)
+{
+    process_t *p = proc_current();
+    return p ? p->uid : 0;  /* No separate euid yet */
+}
+
+long sys_getegid(void)
+{
+    process_t *p = proc_current();
+    return p ? p->gid : 0;  /* No separate egid yet */
+}
 
 /* Directory operation syscalls */
 long sys_chdir(const char *path)
@@ -704,13 +722,52 @@ long sys_access(const char *path, int mode)
     return n ? 0 : -1;
 }
 
-/* Directory reading - simplified implementation */
+/* Directory reading - basic implementation */
 long sys_readdir(int fd, void *dirp, unsigned int count)
 {
-    (void)fd;
-    (void)dirp;
-    (void)count;
-    return -1; /* not yet implemented */
+    fd_entry_t *e = proc_get_fd(fd);
+    if (!e || !dirp) return -1;
+    
+    node_t *dir = e->node;
+    if (!dir || dir->type != NODE_DIR) return -1;
+    
+    /* Simple dirent structure */
+    struct {
+        uint64_t d_ino;
+        uint64_t d_off;
+        uint16_t d_reclen;
+        uint8_t d_type;
+        char d_name[256];
+    } *dent = dirp;
+    
+    /* Use offset as index into children */
+    size_t idx = e->ofs;
+    node_t *child = dir->child;
+    
+    /* Skip to the current offset */
+    for (size_t i = 0; i < idx && child; i++) {
+        child = child->sibling;
+    }
+    
+    if (!child) return 0;  /* End of directory */
+    
+    /* Fill in dirent */
+    dent->d_ino = (uint64_t)(uintptr_t)child;
+    dent->d_off = idx + 1;
+    dent->d_reclen = sizeof(*dent);
+    dent->d_type = (child->type == NODE_DIR) ? 4 : (child->type == NODE_FILE) ? 8 : 2;
+    
+    /* Copy name */
+    int i = 0;
+    while (child->name[i] && i < 255) {
+        dent->d_name[i] = child->name[i];
+        i++;
+    }
+    dent->d_name[i] = '\0';
+    
+    e->ofs = idx + 1;
+    (void)count;  /* Ignore count for now */
+    return sizeof(*dent);
 }
 
 /* File control operations */
@@ -740,24 +797,81 @@ long sys_fcntl(int fd, int cmd, long arg)
 
 long sys_ioctl(int fd, unsigned long request, unsigned long arg)
 {
-    (void)fd;
-    (void)request;
-    (void)arg;
-    return -1; /* simplified - not implemented */
+    fd_entry_t *e = proc_get_fd(fd);
+    if (!e) return -1;
+    
+    node_t *n = e->node;
+    if (!n) return -1;
+    
+    /* Handle terminal ioctls for character devices */
+    if (n->type == NODE_CHAR) {
+        /* TCGETS = 0x5401, TCSETS = 0x5402 */
+        if (request == 0x5401) {
+            /* Get terminal attributes - return success with default values */
+            if (arg) {
+                /* Simplified termios structure */
+                struct {
+                    unsigned int c_iflag;
+                    unsigned int c_oflag;
+                    unsigned int c_cflag;
+                    unsigned int c_lflag;
+                    unsigned char c_line;
+                    unsigned char c_cc[32];
+                } *termios = (void*)arg;
+                termios->c_iflag = 0x2500;  /* ICRNL | IXON */
+                termios->c_oflag = 0x0005;  /* OPOST | ONLCR */
+                termios->c_cflag = 0x00BF;  /* CS8 | CREAD | HUPCL */
+                termios->c_lflag = 0x8A3B;  /* ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN */
+                termios->c_line = 0;
+                for (int i = 0; i < 32; i++) termios->c_cc[i] = 0;
+                termios->c_cc[0] = 3;   /* VINTR = ^C */
+                termios->c_cc[1] = 28;  /* VQUIT = ^\ */
+                termios->c_cc[2] = 127; /* VERASE = DEL */
+                termios->c_cc[3] = 21;  /* VKILL = ^U */
+                termios->c_cc[4] = 4;   /* VEOF = ^D */
+            }
+            return 0;
+        } else if (request == 0x5402) {
+            /* Set terminal attributes - accept but ignore for now */
+            return 0;
+        }
+        /* TIOCGWINSZ = 0x5413 - get window size */
+        else if (request == 0x5413) {
+            if (arg) {
+                struct {
+                    unsigned short ws_row;
+                    unsigned short ws_col;
+                    unsigned short ws_xpixel;
+                    unsigned short ws_ypixel;
+                } *winsize = (void*)arg;
+                winsize->ws_row = 25;
+                winsize->ws_col = 80;
+                winsize->ws_xpixel = 0;
+                winsize->ws_ypixel = 0;
+            }
+            return 0;
+        }
+    }
+    
+    /* Unsupported ioctl */
+    return -1;
 }
 
 long sys_umask(int mask)
 {
     process_t *p = proc_current();
-    (void)p;
-    (void)mask;
-    return 0022; /* default umask */
+    if (!p) return 0022;
+    int old_mask = p->umask;
+    p->umask = mask & 0777;
+    return old_mask;
 }
 
-/* Time syscalls - simplified */
+/* Time syscalls - use real timer ticks */
 long sys_time(long *tloc)
 {
-    long t = 0; /* no real time tracking yet */
+    extern volatile uint64_t ticks;
+    /* Assuming PIT at 18.2Hz (default), convert to seconds */
+    long t = ticks / 18;
     if (tloc) *tloc = t;
     return t;
 }
@@ -766,22 +880,74 @@ long sys_gettimeofday(void *tv, void *tz)
 {
     (void)tz;
     if (!tv) return -1;
+    
+    extern volatile uint64_t ticks;
     struct {
         long tv_sec;
         long tv_usec;
     } *timeval = tv;
-    timeval->tv_sec = 0;
-    timeval->tv_usec = 0;
+    
+    /* PIT ticks at ~18.2Hz, each tick is ~54925 microseconds */
+    timeval->tv_sec = ticks / 18;
+    timeval->tv_usec = (ticks % 18) * 54925;
     return 0;
 }
 
 /* Process control */
 long sys_waitpid(int pid, int *status, int options)
 {
-    (void)pid;
-    (void)options;
-    if (status) *status = 0;
-    return -1; /* no child processes yet */
+    process_t *current = proc_current();
+    if (!current) return -1;
+    
+    /* Special case: wait for any child */
+    if (pid == -1) {
+        /* Find any zombie child */
+        for (int i = 0; i < 64; i++) {
+            extern process_t process_table[];
+            process_t *p = &process_table[i];
+            if (p->state == PROC_STATE_ZOMBIE && p->parent == current) {
+                int child_pid = p->pid;
+                if (status) *status = 0;  /* Exit status not tracked yet */
+                proc_free(p);
+                return child_pid;
+            }
+        }
+        
+        /* Check if we have any children at all */
+        int has_children = 0;
+        for (int i = 0; i < 64; i++) {
+            extern process_t process_table[];
+            process_t *p = &process_table[i];
+            if (p->state != PROC_STATE_UNUSED && p->parent == current) {
+                has_children = 1;
+                break;
+            }
+        }
+        
+        if (!has_children) return -1;  /* ECHILD */
+        
+        /* WNOHANG: return immediately if no zombie */
+        if (options & 1) return 0;
+        
+        /* Would block - not supported yet */
+        return -1;
+    }
+    
+    /* Wait for specific pid */
+    process_t *child = proc_find_by_pid(pid);
+    if (!child || child->parent != current) return -1;
+    
+    if (child->state == PROC_STATE_ZOMBIE) {
+        if (status) *status = 0;
+        proc_free(child);
+        return pid;
+    }
+    
+    /* WNOHANG */
+    if (options & 1) return 0;
+    
+    /* Would block - not supported yet */
+    return -1;
 }
 
 long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5, long a6)

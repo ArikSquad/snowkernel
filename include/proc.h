@@ -31,6 +31,8 @@ typedef struct process {
     uint64_t brk_start;  // base of heap region (virtual user addr)
     uint64_t brk_curr;   // current program break
     uint64_t image_hi;   // highest mapped byte (+1) of current image
+    int umask;           // file creation mask
+    int uid, gid;        // user and group IDs
 } process_t;
 
 /* Process management */
@@ -40,6 +42,9 @@ process_t *proc_find_by_pid(int pid);
 process_t *proc_alloc(void);
 void proc_free(process_t *p);
 void proc_set_current(process_t *p);
+
+/* Process table access */
+extern process_t process_table[];  /* For syscalls that need direct access */
 
 /* File descriptor management */
 int proc_alloc_fd(node_t *n);

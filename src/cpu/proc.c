@@ -4,7 +4,7 @@
 
 #define MAX_PROCESSES 64
 
-static process_t process_table[MAX_PROCESSES];
+process_t process_table[MAX_PROCESSES];  /* Make it accessible for syscalls */
 static process_t *current = 0;
 static int next_pid = 1;
 
@@ -25,6 +25,9 @@ void proc_init(void)
         process_table[i].brk_start = 0;
         process_table[i].brk_curr = 0;
         process_table[i].image_hi = 0;
+        process_table[i].umask = 0022;
+        process_table[i].uid = 0;
+        process_table[i].gid = 0;
         for (int j = 0; j < PROC_FD_MAX; j++)
         {
             process_table[i].fds[j].used = 0;
@@ -46,6 +49,9 @@ void proc_init(void)
     init->brk_start = 0;
     init->brk_curr = 0;
     init->image_hi = 0;
+    init->umask = 0022;
+    init->uid = 0;
+    init->gid = 0;
     
     /* Mark stdin/stdout/stderr as used */
     for (int i = 0; i < 3; i++)
