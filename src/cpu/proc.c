@@ -1,7 +1,10 @@
 #include "proc.h"
 #include "../kernel/kprint.h"
+#include "../kernel/string.h"
 
-static process_t init_proc;
+#define MAX_PROCESSES 64
+
+process_t process_table[MAX_PROCESSES];  /* Make it accessible for syscalls */
 static process_t *current = 0;
 static int next_pid = 1;
 
@@ -9,29 +12,95 @@ process_t *proc_current(void) { return current; }
 
 void proc_init(void)
 {
-    for (int i = 0; i < PROC_FD_MAX; i++)
+    /* Initialize process table */
+    for (int i = 0; i < MAX_PROCESSES; i++)
     {
-        init_proc.fds[i].used = 0;
-        init_proc.fds[i].node = 0;
-        init_proc.fds[i].ofs = 0;
-        init_proc.fds[i].flags = 0;
+        process_table[i].pid = 0;
+        process_table[i].state = PROC_STATE_UNUSED;
+        process_table[i].parent = 0;
+        process_table[i].pml4_phys = 0;
+        process_table[i].alloc_count = 0;
+        process_table[i].kernel_saved_rsp = 0;
+        process_table[i].kernel_saved_rip = 0;
+        process_table[i].brk_start = 0;
+        process_table[i].brk_curr = 0;
+        process_table[i].image_hi = 0;
+        process_table[i].umask = 0022;
+        process_table[i].uid = 0;
+        process_table[i].gid = 0;
+        for (int j = 0; j < PROC_FD_MAX; j++)
+        {
+            process_table[i].fds[j].used = 0;
+            process_table[i].fds[j].node = 0;
+            process_table[i].fds[j].ofs = 0;
+            process_table[i].fds[j].flags = 0;
+        }
     }
-    init_proc.pid = next_pid++;
-    init_proc.parent = 0;
-    init_proc.state = 0;
-    current = &init_proc;
-    init_proc.pml4_phys = 0;
-    init_proc.alloc_count = 0;
-    for (int i = 0; i < PROC_MAX_PAGES; i++)
-        init_proc.alloc_pages[i] = 0;
-    init_proc.kernel_saved_rsp = 0;
-    init_proc.kernel_saved_rip = 0;
-    init_proc.brk_start = 0;
-    init_proc.brk_curr = 0;
-    init_proc.image_hi = 0;
+    
+    /* Create init process (PID 1) */
+    process_t *init = &process_table[0];
+    init->pid = next_pid++;
+    init->parent = 0;
+    init->state = PROC_STATE_RUNNING;
+    init->pml4_phys = 0;
+    init->alloc_count = 0;
+    init->kernel_saved_rsp = 0;
+    init->kernel_saved_rip = 0;
+    init->brk_start = 0;
+    init->brk_curr = 0;
+    init->image_hi = 0;
+    init->umask = 0022;
+    init->uid = 0;
+    init->gid = 0;
+    
+    /* Mark stdin/stdout/stderr as used */
     for (int i = 0; i < 3; i++)
-        current->fds[i].used = 1;
-    kprintf("[proc] init pid=%d created\n", init_proc.pid);
+        init->fds[i].used = 1;
+    
+    current = init;
+    kprintf("[proc] init pid=%d created (kernel process)\n", init->pid);
+}
+
+process_t *proc_find_by_pid(int pid)
+{
+    for (int i = 0; i < MAX_PROCESSES; i++)
+    {
+        if (process_table[i].state != PROC_STATE_UNUSED && process_table[i].pid == pid)
+            return &process_table[i];
+    }
+    return 0;
+}
+
+process_t *proc_alloc(void)
+{
+    for (int i = 0; i < MAX_PROCESSES; i++)
+    {
+        if (process_table[i].state == PROC_STATE_UNUSED)
+        {
+            process_t *p = &process_table[i];
+            kmemset(p, 0, sizeof(process_t));
+            p->pid = next_pid++;
+            p->state = PROC_STATE_RUNNING;
+            p->parent = current;
+            kprintf("[proc] allocated new process pid=%d\n", p->pid);
+            return p;
+        }
+    }
+    kprintf("[proc] ERROR: process table full\n");
+    return 0;
+}
+
+void proc_free(process_t *p)
+{
+    if (!p) return;
+    kprintf("[proc] freeing process pid=%d\n", p->pid);
+    p->state = PROC_STATE_UNUSED;
+    p->pid = 0;
+}
+
+void proc_set_current(process_t *p)
+{
+    current = p;
 }
 
 int proc_set_pml4(uint64_t phys)
